@@ -569,6 +569,8 @@ export interface AnnotationCapability<TTools extends AnnotationToolMap = Annotat
     ): void;
     (toolId: string, patch: Partial<PdfAnnotationObject> & Record<string, unknown>): void;
   };
+  /** Canonical logical PDF-point size for new or explicitly resized Yubin FreeText. */
+  quantizeManagedFreeTextFontSize: (sizePdfPt: number) => number;
 
   getColorPresets: () => string[];
   addColorPreset: (color: string) => void;

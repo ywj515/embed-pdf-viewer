@@ -45,6 +45,28 @@ function isManagedFreeText(annotation: PdfFreeTextAnnoObject): boolean {
   return (annotation.custom as any)?.yubin?.managedFreeText === true;
 }
 
+function getCommittedBrowserLayout(
+  annotation: PdfFreeTextAnnoObject,
+): BrowserFreeTextLayout | null {
+  const layout = (annotation.custom as any)?.yubin?.freeTextLayout as
+    | BrowserFreeTextLayout
+    | undefined;
+  if (
+    layout?.version !== 1 ||
+    layout.sourceText !== annotation.contents ||
+    layout.fontFamily !== annotation.fontFamily ||
+    layout.fontSize !== annotation.fontSize ||
+    layout.textAlign !== annotation.textAlign ||
+    layout.verticalAlign !== annotation.verticalAlign ||
+    Math.abs(layout.rect.width - annotation.rect.size.width) > 0.05 ||
+    Math.abs(layout.rect.height - annotation.rect.size.height) > 0.05 ||
+    !Array.isArray(layout.lines)
+  ) {
+    return null;
+  }
+  return layout;
+}
+
 /**
  * Capture the exact browser line assignment used by the contenteditable.
  * The PDF writer consumes this contract verbatim; it never wraps text again.
@@ -166,7 +188,10 @@ export function FreeText({
     annotation.object.fontSize * scale,
     isEditing,
   );
-
+  const committedLayout =
+    !isEditing && isManagedFreeText(annotation.object)
+      ? getCommittedBrowserLayout(annotation.object)
+      : null;
   useEffect(() => {
     if (isEditing && editorRef.current) {
       editingRef.current = true;
@@ -192,10 +217,17 @@ export function FreeText({
 
   useEffect(() => {
     if (isEditing || !isManagedFreeText(annotation.object) || !editorRef.current) return;
+    // A valid committed contract is authoritative. Rendering its lines must
+    // never feed a second DOM measurement back into annotation state.
+    if (committedLayout) return;
     let cancelled = false;
     const syncLayout = async () => {
       await document.fonts?.ready;
       if (cancelled || !editorRef.current || !annotationProvides) return;
+      // The component may have switched to its authoritative committed-line
+      // presentation while fonts were resolving. Never measure that `pre`
+      // display and overwrite the real `pre-wrap` edit contract.
+      if (getComputedStyle(editorRef.current).whiteSpace === 'pre') return;
       const layout = captureBrowserFreeTextLayout(editorRef.current, annotation.object, scale);
       if (!layout) return;
       const current = (annotation.object.custom as any)?.yubin?.freeTextLayout;
@@ -222,6 +254,7 @@ export function FreeText({
     annotation.object.fontSize,
     annotation.object.textAlign,
     annotation.object.verticalAlign,
+    committedLayout,
   ]);
 
   const handleBlur = () => {
@@ -279,12 +312,25 @@ export function FreeText({
               : annotation.object.verticalAlign === PdfVerticalAlignment.Middle
                 ? 'center'
                 : 'flex-end',
-          display: 'flex',
+          // Anonymous text inside a flex container is a single flex item and
+          // can overflow instead of producing measurable wrapped line rects.
+          // Managed FreeText uses block flow so the captured line contract is
+          // the browser's real wrapping at the canonical PDF-point size.
+          display: isManagedFreeText(annotation.object) ? 'block' : 'flex',
+          alignContent: isManagedFreeText(annotation.object)
+            ? annotation.object.verticalAlign === PdfVerticalAlignment.Top
+              ? 'start'
+              : annotation.object.verticalAlign === PdfVerticalAlignment.Middle
+                ? 'center'
+                : 'end'
+            : undefined,
           backgroundColor: annotation.object.color ?? annotation.object.backgroundColor,
           opacity: annotation.object.opacity,
           width: '100%',
           height: '100%',
           lineHeight: '1.18',
+          whiteSpace: committedLayout ? 'pre' : 'pre-wrap',
+          overflowWrap: 'break-word',
           overflow: 'hidden',
           cursor: isEditing ? 'text' : onClick ? 'pointer' : 'default',
           outline: 'none',
@@ -293,7 +339,9 @@ export function FreeText({
         contentEditable={isEditing}
         {...suppressContentEditableWarningProps}
       >
-        {annotation.object.contents}
+        {committedLayout
+          ? committedLayout.lines.map((line) => line.text).join('\n')
+          : annotation.object.contents}
       </span>
     </div>
   );

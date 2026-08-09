@@ -27,6 +27,7 @@ export * from './tools/types';
 export type { DefaultAnnotationTool, DefaultAnnotationToolMap } from './tools/default-tools';
 export * from './tools/tools-utils';
 export * from './geometry';
+export * from './managed-free-text';
 export * as patching from './patching';
 export type { PatchFunction, TransformContext } from './patching/patch-registry';
 export * from './patching/insert-upright';

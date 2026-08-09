@@ -88,6 +88,7 @@ import {
   setLockedAction,
   syncAnnotationObject as syncAnnotationObjectAction,
 } from './actions';
+import { quantizeManagedFreeTextFontSize } from './managed-free-text';
 import {
   InteractionManagerCapability,
   InteractionManagerPlugin,
@@ -491,7 +492,14 @@ export class AnnotationPlugin extends BasePlugin<
       setToolDefaults: (
         toolId: string,
         patch: Partial<PdfAnnotationObject> & Record<string, unknown>,
-      ) => this.dispatch(setToolDefaults(toolId, patch)),
+      ) => this.dispatch(setToolDefaults(toolId, {
+        ...patch,
+        ...((toolId === 'freeText' || toolId === 'freeTextCallout')
+          && Object.prototype.hasOwnProperty.call(patch, 'fontSize')
+          ? { fontSize: quantizeManagedFreeTextFontSize(Number(patch.fontSize)) }
+          : {}),
+      })),
+      quantizeManagedFreeTextFontSize,
       getColorPresets: () => [...this.state.colorPresets],
       addColorPreset: (color) => this.dispatch(addColorPreset(color)),
       transformAnnotation: (annotation, options) => this.transformAnnotation(annotation, options),
@@ -994,7 +1002,9 @@ export class AnnotationPlugin extends BasePlugin<
       const { annotation, ctx } = item;
       const pageIndex = annotation.pageIndex;
       const id = annotation.id;
-      const managedAnnotation = this.normalizeYubinManagedFreeText(annotation);
+      // Import is deliberately non-migrating. Historical managed sizes remain
+      // unchanged until the user explicitly changes their font size.
+      const managedAnnotation = this.normalizeYubinManagedFreeText(annotation, false);
 
       this.dispatch(createAnnotation(documentId, pageIndex, managedAnnotation));
       if (ctx) contexts.set(id, ctx);
@@ -1026,7 +1036,7 @@ export class AnnotationPlugin extends BasePlugin<
     const contexts = this.pendingContexts.get(docId);
     if (!contexts) return;
 
-    const managedAnnotation = this.normalizeYubinManagedFreeText(annotation);
+    const managedAnnotation = this.normalizeYubinManagedFreeText(annotation, true);
     const newAnnotation = {
       ...managedAnnotation,
       author: managedAnnotation.author ?? this.config.annotationAuthor,
@@ -1077,14 +1087,29 @@ export class AnnotationPlugin extends BasePlugin<
   }
 
   /** Enforce the native Noto writer without changing imported external PDF annotations. */
-  private normalizeYubinManagedFreeText<A extends PdfAnnotationObject>(annotation: A): A {
+  private normalizeYubinManagedFreeText<A extends PdfAnnotationObject>(
+    annotation: A,
+    canonicalizeFontSize: boolean,
+  ): A {
     if (!this.isYubinManagedFreeText(annotation)) return annotation;
-    return { ...annotation, fontFamily: PdfStandardFont.NotoSansKR } as A;
+    return {
+      ...annotation,
+      fontFamily: PdfStandardFont.NotoSansKR,
+      ...(canonicalizeFontSize && 'fontSize' in annotation
+        ? { fontSize: quantizeManagedFreeTextFontSize(Number(annotation.fontSize)) }
+        : {}),
+    } as A;
   }
 
   private buildPatch(original: PdfAnnotationObject, patch: Partial<PdfAnnotationObject>) {
     const normalizedPatch = this.isYubinManagedFreeText(original)
-      ? { ...patch, fontFamily: PdfStandardFont.NotoSansKR }
+      ? {
+          ...patch,
+          fontFamily: PdfStandardFont.NotoSansKR,
+          ...(Object.prototype.hasOwnProperty.call(patch, 'fontSize')
+            ? { fontSize: quantizeManagedFreeTextFontSize(Number((patch as any).fontSize)) }
+            : {}),
+        }
       : patch;
     if ('rect' in normalizedPatch) return normalizedPatch;
 

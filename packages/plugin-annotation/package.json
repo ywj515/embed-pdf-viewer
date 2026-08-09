@@ -36,6 +36,7 @@
   },
   "scripts": {
     "test:commit-race": "node --test test/annotation-plugin-commit-race.test.mjs",
+    "test:managed-freetext": "node --test test/managed-free-text.test.mjs",
     "build:base": "vite build --mode base",
     "build:react": "vite build --mode react",
     "build:preact": "vite build --mode preact",
