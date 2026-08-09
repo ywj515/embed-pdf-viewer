@@ -1,6 +1,10 @@
 # Dependencies
 node_modules
 **/node_modules/
+.pnpm-store/
+.tools/
+_bad_scm/
+out/
 **/dist
 **/.turbo
 config/tsup.config.bundled*

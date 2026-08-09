@@ -1,4 +1,3 @@
 [submodule "packages/pdfium/pdfium-src"]
 	path = packages/pdfium/pdfium-src
 	url = https://github.com/ywj515/runtime.git
-	branch = embedpdf/main
