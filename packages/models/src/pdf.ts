@@ -322,7 +322,11 @@ export enum PdfTrappedStatus {
 }
 
 /**
- *  12 default fonts for PDF
+ * PDF Base-14 fonts plus EmbedPDF's registered Noto Sans KR family.
+ *
+ * `NotoSansKR` is deliberately outside PDFium's Base-14 enum range.  The
+ * engine writes a compatible Helvetica `/DA` for legacy PDF consumers, then
+ * owns the real Type0/CID appearance through the configured, embedded font.
  */
 export enum PdfStandardFont {
   Unknown = -1,
@@ -340,6 +344,8 @@ export enum PdfStandardFont {
   Times_Italic = 11,
   Symbol = 12,
   ZapfDingbats = 13,
+  /** Registered custom FreeText family backed by the configured Hangeul font. */
+  NotoSansKR = 14,
 }
 
 /**

@@ -106,7 +106,7 @@ export interface DeleteAnnotationAction extends Action {
 }
 export interface CommitAction extends Action {
   type: typeof COMMIT_PENDING_CHANGES;
-  payload: { documentId: string; committedUids: string[] };
+  payload: { documentId: string; committedUids: string[]; nativeCreatedUids: string[] };
 }
 export interface PurgeAnnotationAction extends Action {
   type: typeof PURGE_ANNOTATION;
@@ -266,9 +266,10 @@ export const deleteAnnotation = (
 export const commitPendingChanges = (
   documentId: string,
   committedUids: string[],
+  nativeCreatedUids: string[] = [],
 ): CommitAction => ({
   type: COMMIT_PENDING_CHANGES,
-  payload: { documentId, committedUids },
+  payload: { documentId, committedUids, nativeCreatedUids },
 });
 
 export const purgeAnnotation = (

@@ -127,6 +127,9 @@ type MessageType =
   | 'merge'
   | 'mergePages'
   | 'preparePrintDocument'
+  | 'getCommittedLayoutBridgeBuildIdentifier'
+  | 'getCommittedFreeTextLayout'
+  | 'getEmbeddedKoreanFreeTextLayout'
   | 'saveAsCopy'
   | 'closeDocument'
   | 'closeAllDocuments'
@@ -650,6 +653,29 @@ export class RemoteExecutor implements IPdfiumExecutor {
 
   preparePrintDocument(doc: PdfDocumentObject, options?: PdfPrintOptions): PdfTask<ArrayBuffer> {
     return this.send<ArrayBuffer>('preparePrintDocument', [doc, options]);
+  }
+
+  /** Internal bridge identity returned by the actual PDFium worker. */
+  getCommittedLayoutBridgeBuildIdentifier(): PdfTask<string> {
+    return this.send<string>('getCommittedLayoutBridgeBuildIdentifier', []);
+  }
+
+  /**
+   * Internal bridge for the exact, already-committed FreeText AP. The worker
+   * exports the AP and queries PDFium text geometry; it never reflows source
+   * text in JavaScript.
+   */
+  getCommittedFreeTextLayout(
+    docId: string,
+    pageIndex: number,
+    annotation: PdfAnnotationObject,
+  ): PdfTask<unknown> {
+    return this.send<unknown>('getCommittedFreeTextLayout', [docId, pageIndex, annotation]);
+  }
+
+  /** Internal bridge for the committed Korean FreeText AP geometry. */
+  getEmbeddedKoreanFreeTextLayout(docId: string, annotationId: string): PdfTask<unknown> {
+    return this.send<unknown>('getEmbeddedKoreanFreeTextLayout', [docId, annotationId]);
   }
 
   saveAsCopy(doc: PdfDocumentObject): PdfTask<ArrayBuffer> {

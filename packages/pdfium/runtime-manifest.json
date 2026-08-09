@@ -1,0 +1,11 @@
+{
+  "embedpdf_parent_sha": "07ed5fe3739ec22522450863282b1b0618b88a6f",
+  "pdfium_src_sha": "cb29e78f2ba00c9298714d5f4a8bf7765f1e802f",
+  "native_patch_sha256": "992ab45b6186682e40d8fc832fcba7fd62e653976cdefd82bb3ac102494adc56",
+  "pdfium_wasm_sha256": "4bc744890d55abc2599beb9cfef655f07a548533c5835d3ca6526ebff934194e",
+  "pdfium_js_sha256": "ac8f3b5f46b182c67807100632687fd592375f286d90fec41849df8926170d92",
+  "pdfium_cjs_sha256": "3764d21da0fb2cd0b10f595c5bb68b77b8502fd6d0200ed6637da40ec8cfe861",
+  "runtime_id": "yubin-korean-freetext-shared-font-v2",
+  "canonical_font": "backend/assets/fonts/NotoSansKR-Regular.ttf",
+  "canonical_font_sha256": "ca9fb647e6f55084cc8317e16e4ae5d0b584cf979bbcf9eda6a8e934badf380a"
+}

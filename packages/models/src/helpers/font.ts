@@ -13,6 +13,7 @@ export enum PdfStandardFontFamily {
   Times = 'Times',
   Symbol = 'Symbol',
   ZapfDingbats = 'ZapfDingbats',
+  NotoSansKR = 'NotoSansKR',
   Unknown = 'Unknown',
 }
 
@@ -159,6 +160,16 @@ const STANDARD_FONT_DESCRIPTORS: readonly StandardFontDescriptor[] = Object.free
     label: 'Zapf Dingbats',
     css: 'ZapfDingbats, serif',
   },
+  {
+    id: PdfStandardFont.NotoSansKR,
+    family: PdfStandardFontFamily.NotoSansKR,
+    bold: false,
+    italic: false,
+    label: 'Noto Sans KR',
+    // This is a document-global @font-face loaded from the exact same TTF
+    // that PDFium embeds into the committed Type0/CID appearance.
+    css: '"Noto Sans KR", sans-serif',
+  },
 ]);
 
 /* Fast lookup maps */
@@ -278,6 +289,8 @@ export function standardFontFamilyLabel(fam: PdfStandardFontFamily): string {
       return 'Symbol';
     case PdfStandardFontFamily.ZapfDingbats:
       return 'ZapfDingbats';
+    case PdfStandardFontFamily.NotoSansKR:
+      return 'Noto Sans KR';
     /* fallback */
     default:
       return 'Helvetica';

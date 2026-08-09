@@ -416,6 +416,7 @@ export function Annotations(annotationsProps: AnnotationsProps) {
                   pageIndex,
                   documentId,
                   onClick: undefined,
+                  onEditEnd: undefined,
                   appearanceActive,
                 });
               }
@@ -428,6 +429,7 @@ export function Annotations(annotationsProps: AnnotationsProps) {
                 pageIndex,
                 documentId,
                 onClick: nonInteractive ? undefined : onSelect,
+                onEditEnd: nonInteractive ? undefined : () => setEditingId(null),
                 appearanceActive,
               });
             }}

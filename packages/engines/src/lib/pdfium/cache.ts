@@ -2,6 +2,11 @@ import { WrappedPdfiumModule } from '@embedpdf/pdfium';
 import { MemoryManager } from './core/memory-manager';
 import { WasmPointer } from './types/branded';
 
+export type EmbeddedFontEntry = {
+  docPtr: number;
+  fontPtr: number;
+};
+
 export interface CacheConfig {
   /** Time-to-live for pages in milliseconds (default: 5000ms) */
   pageTtl?: number;
@@ -48,6 +53,10 @@ export class PdfCache {
   /** Retrieve the DocumentContext for a given PdfDocumentObject */
   getContext(docId: string): DocumentContext | undefined {
     return this.docs.get(docId);
+  }
+
+  getContexts(): IterableIterator<DocumentContext> {
+    return this.docs.values();
   }
 
   /** Close & fully release a document and all its pages */
@@ -101,6 +110,7 @@ export class PdfCache {
 
 export class DocumentContext {
   private readonly pageCache: PageCache;
+  private readonly embeddedFonts = new Map<string, EmbeddedFontEntry>();
   public readonly normalizeRotation: boolean;
   private disposed = false;
 
@@ -135,6 +145,32 @@ export class DocumentContext {
     return this.pageCache.size();
   }
 
+  getOrLoadEmbeddedFont(
+    key: string,
+    create: () => EmbeddedFontEntry | null,
+  ): { entry: EmbeddedFontEntry | null; cacheHit: boolean } {
+    if (this.disposed) return { entry: null, cacheHit: false };
+    const cached = this.embeddedFonts.get(key);
+    if (cached) return { entry: cached, cacheHit: true };
+    const entry = create();
+    if (entry) this.embeddedFonts.set(key, entry);
+    return { entry, cacheHit: false };
+  }
+
+  getEmbeddedFontCount(): number {
+    return this.embeddedFonts.size;
+  }
+
+  closeEmbeddedFonts(): number {
+    let closed = 0;
+    for (const entry of this.embeddedFonts.values()) {
+      this.pageCache.pdf.FPDFFont_Close(entry.fontPtr);
+      closed++;
+    }
+    this.embeddedFonts.clear();
+    return closed;
+  }
+
   /** Tear down all pages + this document */
   dispose(): void {
     if (this.disposed) return;
@@ -144,6 +180,7 @@ export class DocumentContext {
     this.pageCache.forceReleaseAll();
 
     // 2️⃣ close the PDFium document
+    this.closeEmbeddedFonts();
     this.pageCache.pdf.FPDF_CloseDocument(this.docPtr);
 
     // 3️⃣ free the file handle through memory manager for proper tracking

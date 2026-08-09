@@ -8,6 +8,7 @@ import {
   ignore,
   PdfAnnotationObject,
   PdfAnnotationSubtype,
+  PdfStandardFont,
   PdfDocumentObject,
   PdfErrorReason,
   Task,
@@ -993,8 +994,9 @@ export class AnnotationPlugin extends BasePlugin<
       const { annotation, ctx } = item;
       const pageIndex = annotation.pageIndex;
       const id = annotation.id;
+      const managedAnnotation = this.normalizeYubinManagedFreeText(annotation);
 
-      this.dispatch(createAnnotation(documentId, pageIndex, annotation));
+      this.dispatch(createAnnotation(documentId, pageIndex, managedAnnotation));
       if (ctx) contexts.set(id, ctx);
     }
 
@@ -1024,9 +1026,10 @@ export class AnnotationPlugin extends BasePlugin<
     const contexts = this.pendingContexts.get(docId);
     if (!contexts) return;
 
+    const managedAnnotation = this.normalizeYubinManagedFreeText(annotation);
     const newAnnotation = {
-      ...annotation,
-      author: annotation.author ?? this.config.annotationAuthor,
+      ...managedAnnotation,
+      author: managedAnnotation.author ?? this.config.annotationAuthor,
     };
     const editAfterCreate = options?.editAfterCreate;
     const execute = () => {
@@ -1068,12 +1071,26 @@ export class AnnotationPlugin extends BasePlugin<
     historyScope.register(command, this.ANNOTATION_HISTORY_TOPIC);
   }
 
+  private isYubinManagedFreeText(annotation: PdfAnnotationObject): boolean {
+    return annotation.type === PdfAnnotationSubtype.FREETEXT
+      && (annotation as any).custom?.yubin?.managedFreeText === true;
+  }
+
+  /** Enforce the native Noto writer without changing imported external PDF annotations. */
+  private normalizeYubinManagedFreeText<A extends PdfAnnotationObject>(annotation: A): A {
+    if (!this.isYubinManagedFreeText(annotation)) return annotation;
+    return { ...annotation, fontFamily: PdfStandardFont.NotoSansKR } as A;
+  }
+
   private buildPatch(original: PdfAnnotationObject, patch: Partial<PdfAnnotationObject>) {
-    if ('rect' in patch) return patch;
+    const normalizedPatch = this.isYubinManagedFreeText(original)
+      ? { ...patch, fontFamily: PdfStandardFont.NotoSansKR }
+      : patch;
+    if ('rect' in normalizedPatch) return normalizedPatch;
 
     return this.transformAnnotation(original, {
       type: 'property-update',
-      changes: patch,
+      changes: normalizedPatch,
     });
   }
 
@@ -1124,6 +1141,9 @@ export class AnnotationPlugin extends BasePlugin<
     const originalPatch = Object.fromEntries(
       Object.keys(patch).map((key) => [key, originalObject[key as keyof PdfAnnotationObject]]),
     );
+    if (this.isYubinManagedFreeText(originalObject)) {
+      originalPatch.fontFamily = PdfStandardFont.NotoSansKR;
+    }
     const command: Command<AnnotationCommandMetadata> = {
       execute,
       undo: () => {
@@ -2508,7 +2528,7 @@ export class AnnotationPlugin extends BasePlugin<
       .map(({ pageIndex, id, patch }) => {
         const originalObject = docState.byUid[id]?.object;
         if (!originalObject) return null;
-        return { pageIndex, id, patch, originalObject };
+        return { pageIndex, id, patch: this.buildPatch(originalObject, patch), originalObject };
       })
       .filter((p): p is NonNullable<typeof p> => p !== null);
 
@@ -2540,9 +2560,14 @@ export class AnnotationPlugin extends BasePlugin<
     const undoData = moveData.map(({ pageIndex, id, patch, originalObject }) => ({
       pageIndex,
       id,
-      originalPatch: Object.fromEntries(
-        Object.keys(patch).map((key) => [key, originalObject[key as keyof PdfAnnotationObject]]),
-      ),
+      originalPatch: {
+        ...Object.fromEntries(
+          Object.keys(patch).map((key) => [key, originalObject[key as keyof PdfAnnotationObject]]),
+        ),
+        ...(this.isYubinManagedFreeText(originalObject)
+          ? { fontFamily: PdfStandardFont.NotoSansKR }
+          : {}),
+      },
       originalObject,
     }));
 
@@ -2929,20 +2954,48 @@ export class AnnotationPlugin extends BasePlugin<
     const allTasks = pendingOps.map((op) => op.task);
     Task.allSettled(allTasks).wait(
       () => {
-        // Emit events for all completed operations
+        // Emit events only for operations that the engine actually resolved.
         this.emitCommitEvents(docId, pendingOps, contexts);
 
-        // Invalidate appearance cache for committed annotations that had AP regenerated
-        // Skip moved annotations -- moves preserve the appearance stream
-        for (const op of pendingOps) {
+        const resolvedOps = pendingOps.filter(
+          (op) => op.task.state.stage === TaskStage.Resolved,
+        );
+
+        // Invalidate appearance cache only for successful operations that had
+        // AP regenerated. A rejected create can leave a transient native
+        // object behind until the document is closed; treating it as committed
+        // previously allowed that Helvetica placeholder to reach saveAsCopy().
+        // Skip moved annotations -- moves preserve the appearance stream.
+        for (const op of resolvedOps) {
           if (op.type === 'update' && op.moved) continue;
-          if (op.type === 'create' || op.type === 'update' || op.type === 'delete') {
-            this.invalidateAnnotationAppearance(op.ta.object.id, op.ta.object.pageIndex, docId);
-          }
+          this.invalidateAnnotationAppearance(op.ta.object.id, op.ta.object.pageIndex, docId);
         }
 
-        // Update state
-        this.dispatch(commitPendingChanges(docId, batch.committedUids));
+        // Acknowledge only operations that resolved and whose model object is
+        // still the exact snapshot submitted to the engine. A UI update may
+        // arrive while this batch is in flight; marking that newer object
+        // synced would drop its native update before the follow-up commit.
+        const currentState = this.getDocumentState(docId);
+        const stableResolvedUids = resolvedOps
+          .filter((op) => currentState.byUid[op.uid]?.object === op.ta.object)
+          .map((op) => op.uid);
+        const nativeCreatedUids = resolvedOps
+          .filter((op) => op.type === 'create')
+          .map((op) => op.uid);
+        this.dispatch(commitPendingChanges(docId, stableResolvedUids, nativeCreatedUids));
+
+        const failedOp = pendingOps.find(
+          (op) => op.task.state.stage !== TaskStage.Resolved,
+        );
+        const failedState = failedOp?.task.state;
+        if (
+          failedState?.stage === TaskStage.Rejected ||
+          failedState?.stage === TaskStage.Aborted
+        ) {
+          task.reject(failedState.reason);
+          return;
+        }
+
         task.resolve(true);
       },
       (error) => task.fail(error),

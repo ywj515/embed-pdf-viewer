@@ -158,6 +158,8 @@ export interface AnnotationRendererProps<T extends PdfAnnotationObject = PdfAnno
   pageIndex: number;
   documentId: string;
   onClick?: (e: AnnotationInteractionEvent) => void;
+  /** End content editing while preserving selection (e.g. after a FreeText blur). */
+  onEditEnd?: () => void;
   /** When true, AP canvas provides the visual; component should only render hit area */
   appearanceActive: boolean;
 }

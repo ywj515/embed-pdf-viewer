@@ -347,6 +347,7 @@ export const builtInRenderers: BoxedAnnotationRenderer[] = [
       pageIndex,
       documentId,
       onClick,
+      onEditEnd,
       appearanceActive,
     }) => (
       <FreeText
@@ -357,6 +358,7 @@ export const builtInRenderers: BoxedAnnotationRenderer[] = [
         pageIndex={pageIndex}
         scale={scale}
         onClick={onClick}
+        onEditEnd={onEditEnd}
         appearanceActive={appearanceActive}
       />
     ),

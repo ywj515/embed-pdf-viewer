@@ -1134,6 +1134,95 @@ export class PdfEngine<T = Blob> implements IPdfEngine<T> {
     );
   }
 
+  /** Returns the identity of the worker implementation serving layout geometry. */
+  getCommittedLayoutBridgeBuildIdentifier(): PdfTask<string> {
+    return this.workerQueue.enqueue(
+      {
+        execute: () => {
+          const method = (this.executor as any).getCommittedLayoutBridgeBuildIdentifier;
+          if (typeof method !== 'function') {
+            const task = new Task<string, PdfErrorReason>();
+            task.reject({
+              code: PdfErrorCode.NotSupport,
+              message: 'Committed Korean FreeText geometry bridge is unavailable in this runtime',
+            });
+            return task;
+          }
+          const result = method.call(this.executor);
+          if (result && typeof result === 'object' && 'wait' in result) return result;
+          const task = new Task<string, PdfErrorReason>();
+          task.resolve(String(result));
+          return task;
+        },
+        meta: { operation: 'getCommittedLayoutBridgeBuildIdentifier' },
+      },
+      { priority: Priority.HIGH },
+    );
+  }
+
+  /**
+   * Returns PDFium glyph geometry from the exact committed FreeText AP. This
+   * path is deliberately generic so the established Latin/Helvetica writer is
+   * inspected rather than replaced.
+   */
+  getCommittedFreeTextLayout(
+    docId: string,
+    pageIndex: number,
+    annotation: PdfAnnotationObject,
+  ): PdfTask<unknown> {
+    return this.workerQueue.enqueue(
+      {
+        execute: () => {
+          const method = (this.executor as any).getCommittedFreeTextLayout;
+          if (typeof method !== 'function') {
+            const task = new Task<unknown, PdfErrorReason>();
+            task.reject({
+              code: PdfErrorCode.NotSupport,
+              message: 'Committed FreeText geometry bridge is unavailable in this runtime',
+            });
+            return task;
+          }
+          const result = method.call(this.executor, docId, pageIndex, annotation);
+          if (result && typeof result === 'object' && 'wait' in result) return result;
+          const task = new Task<unknown, PdfErrorReason>();
+          task.resolve(result);
+          return task;
+        },
+        meta: { docId, operation: 'getCommittedFreeTextLayout' },
+      },
+      { priority: Priority.HIGH },
+    );
+  }
+
+  /**
+   * Returns only PDFium-measured geometry from the committed native Korean
+   * FreeText appearance. Callers must reject selections when it is absent.
+   */
+  getEmbeddedKoreanFreeTextLayout(docId: string, annotationId: string): PdfTask<unknown> {
+    return this.workerQueue.enqueue(
+      {
+        execute: () => {
+          const method = (this.executor as any).getEmbeddedKoreanFreeTextLayout;
+          if (typeof method !== 'function') {
+            const task = new Task<unknown, PdfErrorReason>();
+            task.reject({
+              code: PdfErrorCode.NotSupport,
+              message: 'Committed Korean FreeText geometry is unavailable in this runtime',
+            });
+            return task;
+          }
+          const result = method.call(this.executor, docId, annotationId);
+          if (result && typeof result === 'object' && 'wait' in result) return result;
+          const task = new Task<unknown, PdfErrorReason>();
+          task.resolve(result);
+          return task;
+        },
+        meta: { docId, operation: 'getEmbeddedKoreanFreeTextLayout' },
+      },
+      { priority: Priority.HIGH },
+    );
+  }
+
   saveAsCopy(doc: PdfDocumentObject): PdfTask<ArrayBuffer> {
     return this.workerQueue.enqueue(
       {

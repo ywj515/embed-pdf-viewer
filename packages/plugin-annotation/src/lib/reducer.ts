@@ -414,11 +414,12 @@ export const reducer: Reducer<AnnotationState, AnnotationAction> = (state, actio
     }
 
     case COMMIT_PENDING_CHANGES: {
-      const { documentId, committedUids } = action.payload;
+      const { documentId, committedUids, nativeCreatedUids } = action.payload;
       const docState = state.documents[documentId];
       if (!docState) return state;
 
       const committedSet = new Set(committedUids);
+      const nativeCreatedSet = new Set(nativeCreatedUids);
       const cleaned: Record<string, TrackedAnnotation> = {};
       let stillHasPending = false;
 
@@ -432,6 +433,12 @@ export const reducer: Reducer<AnnotationState, AnnotationAction> = (state, actio
                 ? 'synced'
                 : ta.commitState,
           };
+        } else if (nativeCreatedSet.has(uid) && ta.commitState === 'new') {
+          // The engine created this UID, but the UI replaced its model object
+          // while creation was in flight. The native object now exists, so the
+          // newer revision must be an in-place update rather than another create.
+          cleaned[uid] = { ...ta, commitState: 'dirty' };
+          stillHasPending = true;
         } else {
           // This UID was not committed - keep its current state
           cleaned[uid] = ta;

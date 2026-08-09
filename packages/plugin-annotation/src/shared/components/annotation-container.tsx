@@ -679,6 +679,7 @@ export function AnnotationContainer<T extends PdfAnnotationObject>({
 
         {/* Inner div: drag/resize/vertex interaction — no blend mode */}
         <div
+          data-epdf-annotation-interaction-id={trackedAnnotation.object.id}
           {...(effectiveIsDraggable && isSelected ? dragProps : {})}
           {...doubleProps}
           style={{

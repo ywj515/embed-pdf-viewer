@@ -32,12 +32,21 @@ export const freeTextHandlerFactory: HandlerFactory<PdfFreeTextAnnoObject> = {
         fontColor: tool.defaults.fontColor ?? '#000000',
         opacity: tool.defaults.opacity ?? 1,
         fontSize: tool.defaults.fontSize ?? 12,
-        fontFamily: tool.defaults.fontFamily ?? PdfStandardFont.Helvetica,
+        // This is the actual creation factory. Family 14 must be present
+        // before `onCommit()` inserts the object into AnnotationPlugin.
+        fontFamily: PdfStandardFont.NotoSansKR,
         color: tool.defaults.color ?? tool.defaults.backgroundColor ?? 'transparent',
         textAlign: tool.defaults.textAlign ?? PdfTextAlignment.Left,
         verticalAlign: tool.defaults.verticalAlign ?? PdfVerticalAlignment.Top,
         contents: tool.defaults.contents ?? 'Insert text here',
         flags: tool.defaults.flags ?? ['print'],
+        custom: {
+          ...(tool.defaults.custom ?? {}),
+          yubin: {
+            ...((tool.defaults.custom as any)?.yubin ?? {}),
+            managedFreeText: true,
+          },
+        },
       };
     };
 

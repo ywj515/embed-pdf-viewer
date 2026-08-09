@@ -51,9 +51,11 @@
     "lint": "eslint src --color",
     "lint:fix": "eslint src --color --fix",
     "prewasm": "node ./scripts/generate-exported-functions.js && node ./scripts/generate-exported-runtime-methods.js",
-    "wasm": "make build && pnpm run wasm:copy",
-    "wasm:copy": "cpy \"./docker/dist/{pdfium.cjs,pdfium.js,pdfium.wasm,functions.ts,runtime-methods.ts}\" ./src/vendor --flat",
-    "build:all": "pnpm run wasm && pnpm run build"
+    "wasm": "pnpm run wasm:build && pnpm run wasm:copy",
+    "wasm:copy": "cpy \"./build/wasm/{pdfium.cjs,pdfium.js,pdfium.wasm,functions.ts,runtime-methods.ts}\" ./src/vendor --flat",
+    "runtime:manifest": "node ./scripts/write-runtime-manifest.mjs",
+    "build:runtime": "node ./scripts/build-runtime.mjs",
+    "build:all": "pnpm run build:runtime"
   },
   "files": [
     "dist",

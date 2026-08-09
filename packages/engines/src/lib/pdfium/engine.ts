@@ -137,10 +137,10 @@ import {
 } from '@embedpdf/models';
 import { computeFormDrawParams, isValidCustomKey, readArrayBuffer, readString } from './helper';
 import { WrappedPdfiumModule } from '@embedpdf/pdfium';
-import { DocumentContext, PageContext, PdfCache } from './cache';
+import { DocumentContext, EmbeddedFontEntry, PageContext, PdfCache } from './cache';
 import { MemoryManager } from './core/memory-manager';
 import { WasmPointer } from './types/branded';
-import { FontFallbackManager, FontFallbackConfig } from './font-fallback';
+import { FontCharset, FontFallbackManager, FontFallbackConfig } from './font-fallback';
 
 /**
  * Format of bitmap
@@ -198,9 +198,82 @@ export interface PdfiumEngineOptions {
 }
 
 /**
+ * Identifies the engine bundle paired with the native FreeText appearance
+ * wrapper fix in the pinned PDFium WASM build.
+ */
+export const YUBIN_PDFIUM_RUNTIME_BUILD_ID =
+  'yubin-korean-freetext-shared-font-v2';
+export const YUBIN_COMMITTED_LAYOUT_BRIDGE_BUILD_ID =
+  'yubin-committed-layout-bridge-v1';
+
+type EmbeddedKoreanFreeTextLine = {
+  text: string;
+  sourceStart: number;
+  sourceEnd: number;
+  width: number;
+  origin: { x: number; y: number };
+  bounds: { left: number; bottom: number; right: number; top: number };
+};
+
+type BrowserFreeTextLayout = {
+  version: 1;
+  sourceText: string;
+  rect: { width: number; height: number };
+  fontFamily: number;
+  fontSize: number;
+  textAlign: number;
+  verticalAlign: number;
+  lineHeight: number;
+  lines: Array<{
+    text: string;
+    sourceStart: number;
+    sourceEnd: number;
+    x: number;
+    baselineFromTop: number;
+  }>;
+};
+
+type EmbeddedKoreanFreeTextLayout = {
+  annotationId: string;
+  rectangle: { width: number; height: number };
+  padding: number;
+  availableWidth: number;
+  fontSize: number;
+  ascent: number;
+  descent: number;
+  lineAdvance: number;
+  textAlign: PdfTextAlignment;
+  lines: EmbeddedKoreanFreeTextLine[];
+  characters: Array<{
+    text: string;
+    sourceStart: number;
+    sourceEnd: number;
+    box: { left: number; bottom: number; right: number; top: number };
+  }>;
+};
+
+type CommittedFreeTextLayout = EmbeddedKoreanFreeTextLayout & {
+  sourceText: string;
+  sourceEncoding: 'utf-16';
+  geometrySource: 'native-korean-appearance' | 'exported-committed-appearance';
+  appearanceMatrix: { a: number; b: number; c: number; d: number; e: number; f: number };
+};
+
+/**
  * Pdf engine that based on pdfium wasm
  */
 export class PdfiumNative implements IPdfiumExecutor {
+  /**
+   * PDFium owns loaded-font handles separately from the annotation objects
+   * that reference them.  Keep one Hangeul font handle per open document,
+   * reuse it for FreeText updates, and release it before the document closes.
+   */
+  private embeddedKoreanFreeTextFontLoads = 0;
+  private embeddedKoreanFreeTextFontCacheHits = 0;
+  private embeddedKoreanFreeTextFontCloses = 0;
+  private embeddedKoreanFreeTextAppearanceRebuilds = 0;
+  /** The exact PDFium-metric layout used for the currently committed AP. */
+  private readonly embeddedKoreanFreeTextLayouts = new Map<string, EmbeddedKoreanFreeTextLayout>();
   /**
    * pdf documents that opened
    */
@@ -259,6 +332,19 @@ export class PdfiumNative implements IPdfiumExecutor {
       this.fontFallbackManager.initialize(this.pdfiumModule);
       this.logger.info(LOG_SOURCE, LOG_CATEGORY, 'Font fallback system enabled');
     }
+  }
+
+  /**
+   * Exposed for isolated runtime provenance checks in the Korean FreeText
+   * harness. The accompanying PDFium binary is recorded by SHA-256.
+   */
+  getRuntimeBuildIdentifier(): string {
+    return YUBIN_PDFIUM_RUNTIME_BUILD_ID;
+  }
+
+  /** @internal Identifies the worker bridge used for committed glyph geometry. */
+  getCommittedLayoutBridgeBuildIdentifier(): string {
+    return YUBIN_COMMITTED_LAYOUT_BRIDGE_BUILD_ID;
   }
 
   /**
@@ -1284,7 +1370,6 @@ export class PdfiumNative implements IPdfiumExecutor {
 
     // Rotate vertices for PDF storage if the annotation has rotation
     const saveAnnotation = this.prepareAnnotationForSave(annotation);
-
     let isSucceed = false;
     switch (saveAnnotation.type) {
       case PdfAnnotationSubtype.INK:
@@ -1319,6 +1404,7 @@ export class PdfiumNative implements IPdfiumExecutor {
       case PdfAnnotationSubtype.FREETEXT:
         isSucceed = this.addFreeTextContent(
           doc,
+          ctx.docPtr,
           page,
           pageCtx.pagePtr,
           annotationPtr,
@@ -1440,7 +1526,11 @@ export class PdfiumNative implements IPdfiumExecutor {
       });
     }
 
-    if (annotation.type === PdfAnnotationSubtype.WIDGET) {
+    if (this.requiresEmbeddedKoreanFreeTextAppearance(saveAnnotation)) {
+      // `addFreeTextContent()` already assembled this annotation's normal AP
+      // from native text objects. Regenerating it would replace the embedded
+      // CID font with the built-in Helvetica-only FreeText writer.
+    } else if (annotation.type === PdfAnnotationSubtype.WIDGET) {
       this.pdfiumModule.EPDFAnnot_GenerateFormFieldAP(annotationPtr);
     } else if (annotation.blendMode !== undefined) {
       this.pdfiumModule.EPDFAnnot_GenerateAppearanceWithBlend(annotationPtr, annotation.blendMode);
@@ -1448,7 +1538,9 @@ export class PdfiumNative implements IPdfiumExecutor {
       this.pdfiumModule.EPDFAnnot_GenerateAppearance(annotationPtr);
     }
 
-    this.pdfiumModule.FPDFPage_GenerateContent(pageCtx.pagePtr);
+    if (!this.requiresEmbeddedKoreanFreeTextAppearance(saveAnnotation)) {
+      this.pdfiumModule.FPDFPage_GenerateContent(pageCtx.pagePtr);
+    }
 
     this.pdfiumModule.FPDFPage_CloseAnnot(annotationPtr);
     pageCtx.release();
@@ -1581,6 +1673,7 @@ export class PdfiumNative implements IPdfiumExecutor {
       case PdfAnnotationSubtype.FREETEXT: {
         ok = this.addFreeTextContent(
           doc,
+          ctx.docPtr,
           page,
           pageCtx.pagePtr,
           annotPtr,
@@ -1701,14 +1794,18 @@ export class PdfiumNative implements IPdfiumExecutor {
 
     /* 4 ── regenerate appearance if payload was changed ───────────────────── */
     if (ok && options?.regenerateAppearance !== false) {
-      if (annotation.type === PdfAnnotationSubtype.WIDGET) {
+      if (this.requiresEmbeddedKoreanFreeTextAppearance(saveAnnotation)) {
+        // The embedded appearance is already complete; see creation path.
+      } else if (annotation.type === PdfAnnotationSubtype.WIDGET) {
         this.pdfiumModule.EPDFAnnot_GenerateFormFieldAP(annotPtr);
       } else if (annotation.blendMode !== undefined) {
         this.pdfiumModule.EPDFAnnot_GenerateAppearanceWithBlend(annotPtr, annotation.blendMode);
       } else {
         this.pdfiumModule.EPDFAnnot_GenerateAppearance(annotPtr);
       }
-      this.pdfiumModule.FPDFPage_GenerateContent(pageCtx.pagePtr);
+      if (!this.requiresEmbeddedKoreanFreeTextAppearance(saveAnnotation)) {
+        this.pdfiumModule.FPDFPage_GenerateContent(pageCtx.pagePtr);
+      }
     }
 
     /* 5 ── tidy-up native handles ──────────────────────────────────────────── */
@@ -3246,7 +3343,10 @@ export class PdfiumNative implements IPdfiumExecutor {
     this.logger.debug(LOG_SOURCE, LOG_CATEGORY, 'closeDocument', doc);
     this.logger.perf(LOG_SOURCE, LOG_CATEGORY, `CloseDocument`, 'Begin', doc.id);
 
+    this.releaseEmbeddedKoreanFreeTextLayouts(doc.id);
+    const fontCount = this.cache.getContext(doc.id)?.getEmbeddedFontCount() ?? 0;
     this.cache.closeDocument(doc.id);
+    this.embeddedKoreanFreeTextFontCloses += fontCount;
 
     this.logger.perf(LOG_SOURCE, LOG_CATEGORY, `CloseDocument`, 'End', doc.id);
     return PdfTaskHelper.resolve(true);
@@ -3260,7 +3360,10 @@ export class PdfiumNative implements IPdfiumExecutor {
   closeAllDocuments() {
     this.logger.debug(LOG_SOURCE, LOG_CATEGORY, 'closeAllDocuments');
     this.logger.perf(LOG_SOURCE, LOG_CATEGORY, `CloseAllDocuments`, 'Begin');
+    const fontCount = [...this.cache.getContexts()].reduce((count, ctx) => count + ctx.getEmbeddedFontCount(), 0);
+    this.embeddedKoreanFreeTextLayouts.clear();
     this.cache.closeAllDocuments();
+    this.embeddedKoreanFreeTextFontCloses += fontCount;
     this.logger.perf(LOG_SOURCE, LOG_CATEGORY, `CloseAllDocuments`, 'End');
     return PdfTaskHelper.resolve(true);
   }
@@ -3364,6 +3467,7 @@ export class PdfiumNative implements IPdfiumExecutor {
    */
   private addFreeTextContent(
     doc: PdfDocumentObject,
+    docPtr: number,
     page: PdfPageObject,
     pagePtr: number,
     annotationPtr: number,
@@ -3392,7 +3496,7 @@ export class PdfiumNative implements IPdfiumExecutor {
     if (
       !this.setAnnotationDefaultAppearance(
         annotationPtr,
-        annotation.fontFamily === PdfStandardFont.Unknown
+        annotation.fontFamily === PdfStandardFont.Unknown || annotation.fontFamily === PdfStandardFont.NotoSansKR
           ? PdfStandardFont.Helvetica
           : annotation.fontFamily,
         annotation.fontSize,
@@ -3439,7 +3543,699 @@ export class PdfiumNative implements IPdfiumExecutor {
     this.setRectangleDifferences(annotationPtr, annotation.rectangleDifferences);
 
     // Apply base annotation properties (author, contents, dates, flags, custom, IRT, RT)
-    return this.applyBaseAnnotationProperties(doc, page, pagePtr, annotationPtr, annotation);
+    if (!this.applyBaseAnnotationProperties(doc, page, pagePtr, annotationPtr, annotation)) {
+      return false;
+    }
+
+    // `/DA` cannot name a Type0/CID font through PDFium's Base-14 API. Keep
+    // the model identity in an annotation-owned key so save/reopen restores
+    // the selected family rather than inferring it from the text contents.
+    if (!this.setAnnotString(
+      annotationPtr,
+      'EPDF:YubinFontFamily',
+      this.requiresEmbeddedKoreanFreeTextAppearance(annotation) ? 'NotoSansKR' : '',
+    )) {
+      return false;
+    }
+
+    if (this.requiresEmbeddedKoreanFreeTextAppearance(annotation)) {
+      return this.addEmbeddedKoreanFreeTextAppearance(
+        doc,
+        docPtr,
+        page,
+        annotationPtr,
+        annotation,
+      );
+    }
+
+    return true;
+  }
+
+  /**
+   * Embed a configured Hangeul font in a native PDFium FreeText appearance.
+   *
+   * The stock writer only accepts a Base-14 enum in `/DA`, so registered
+   * custom families need a native appearance. The public annotation model
+   * selects this path explicitly with `PdfStandardFont.NotoSansKR`; contents
+   * never select a renderer. `/DA` remains compatible Helvetica while `/AP/N`
+   * is the canonical embedded Type0/CID appearance.
+   */
+  private addEmbeddedKoreanFreeTextAppearance(
+    doc: PdfDocumentObject,
+    docPtr: number,
+    page: PdfPageObject,
+    annotationPtr: number,
+    annotation: PdfFreeTextAnnoObject,
+  ): boolean {
+    const ctx = this.cache.getContext(doc.id);
+    if (!ctx) return false;
+    const fontContext = this.getEmbeddedKoreanFreeTextFont(ctx);
+    if (!fontContext) return false;
+    this.embeddedKoreanFreeTextAppearanceRebuilds++;
+
+    // FreeText does not support FPDFAnnot_AppendObject in this PDFium build.
+    // Assemble a temporary native page in the target document itself. The
+    // native same-document AP path retains its immutable indirect resources
+    // (notably the loaded Type0/CID font graph) by reference.
+    const appearancePageIndex = this.pdfiumModule.FPDF_GetPageCount(docPtr);
+    const appearancePagePtr = this.pdfiumModule.FPDFPage_New(
+      docPtr,
+      appearancePageIndex,
+      annotation.rect.size.width,
+      annotation.rect.size.height,
+    );
+    if (!appearancePagePtr) {
+      this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'Could not create Korean FreeText appearance page');
+      return false;
+    }
+    const discardAppearancePage = () => {
+      this.pdfiumModule.FPDF_ClosePage(appearancePagePtr);
+      this.pdfiumModule.FPDFPage_Delete(docPtr, appearancePageIndex);
+    };
+
+    const { red, green, blue } = webColorToPdfColor(annotation.fontColor ?? '#000000');
+    const fontSize = annotation.fontSize || 12;
+    const browserLayout = this.getBrowserFreeTextLayout(annotation);
+    if (!browserLayout) {
+      discardAppearancePage();
+      return false;
+    }
+    const padding = 0;
+    const availableWidth = annotation.rect.size.width;
+    const metrics = this.getEmbeddedKoreanFreeTextMetrics(fontContext.fontPtr, fontSize);
+    if (!metrics) {
+      discardAppearancePage();
+      return false;
+    }
+    const lineAdvance = browserLayout.lineHeight;
+    const layoutLines = browserLayout.lines.map((line): EmbeddedKoreanFreeTextLine => {
+      const bounds = line.text
+        ? this.measureEmbeddedKoreanFreeText(fontContext, line.text, fontSize)
+        : { left: 0, bottom: 0, right: 0, top: 0 };
+      return {
+        text: line.text,
+        sourceStart: line.sourceStart,
+        sourceEnd: line.sourceEnd,
+        width: bounds.right - bounds.left,
+        origin: {
+          x: line.x,
+          y: annotation.rect.size.height - line.baselineFromTop,
+        },
+        bounds,
+      };
+    });
+
+    for (const lineLayout of layoutLines) {
+      // PDFium rejects a zero-glyph text object. Keep the logical empty line
+      // in the authoritative layout so its vertical advance is preserved.
+      if (lineLayout.text.length === 0) continue;
+      const textObjectPtr = this.pdfiumModule.FPDFPageObj_CreateTextObj(
+        docPtr,
+        fontContext.fontPtr,
+        fontSize,
+      );
+      if (!textObjectPtr) {
+        this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'Could not create Korean FreeText text object');
+        discardAppearancePage();
+        return false;
+      }
+
+      const line = lineLayout.text;
+      this.logger.debug(
+        LOG_SOURCE,
+        LOG_CATEGORY,
+        'Korean FreeText writer code points',
+        Array.from(line, (character) => character.codePointAt(0)?.toString(16)).join(' '),
+      );
+      const setText = this.withWString(line, (textPtr) =>
+        this.pdfiumModule.FPDFText_SetText(textObjectPtr, textPtr),
+      );
+      if (!setText || !this.pdfiumModule.FPDFPageObj_SetFillColor(textObjectPtr, red, green, blue, 255)) {
+        this.pdfiumModule.FPDFPageObj_Destroy(textObjectPtr);
+        this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'Could not set Korean FreeText text content or colour');
+        discardAppearancePage();
+        return false;
+      }
+
+      this.pdfiumModule.FPDFPageObj_Transform(
+        textObjectPtr,
+        1,
+        0,
+        0,
+        1,
+        lineLayout.origin.x,
+        lineLayout.origin.y,
+      );
+      this.pdfiumModule.FPDFPage_InsertObject(appearancePagePtr, textObjectPtr);
+    }
+
+    const generated = this.pdfiumModule.FPDFPage_GenerateContent(appearancePagePtr);
+    const characters = generated
+      ? this.collectEmbeddedKoreanFreeTextCharacterBoxes(appearancePagePtr, layoutLines)
+      : null;
+    // Geometry read-back is a diagnostic consumer of the completed AP.  It
+    // must never decide whether a valid visible FreeText is committed: at a
+    // wrapping boundary PDFium text extraction can omit a glyph even though
+    // the native page and normal appearance are valid.  Coupling the two made
+    // creation report success while the caller's failure cleanup removed the
+    // annotation before saveAsCopy().
+    const assigned = generated && this.pdfiumModule.EPDFAnnot_SetAppearanceFromPage(
+      annotationPtr,
+      docPtr,
+      appearancePageIndex,
+    );
+    discardAppearancePage();
+    if (!assigned) {
+      this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'Could not assign Korean FreeText appearance from native page');
+      return false;
+    }
+    if (characters) {
+      this.embeddedKoreanFreeTextLayouts.set(`${doc.id}:${annotation.id}`, {
+        annotationId: annotation.id,
+        rectangle: { width: annotation.rect.size.width, height: annotation.rect.size.height },
+        padding,
+        availableWidth,
+        fontSize,
+        ascent: metrics.ascent,
+        descent: metrics.descent,
+        lineAdvance,
+        textAlign: annotation.textAlign ?? PdfTextAlignment.Left,
+        lines: layoutLines,
+        characters,
+      });
+    } else {
+      this.embeddedKoreanFreeTextLayouts.delete(`${doc.id}:${annotation.id}`);
+      this.logger.error(
+        LOG_SOURCE,
+        LOG_CATEGORY,
+        'Korean FreeText appearance committed without bridge glyph geometry',
+      );
+    }
+    return true;
+  }
+
+  /** Accept only a layout measured by the managed contenteditable for the
+   * exact current model revision. Missing or stale geometry fails the commit;
+   * the PDF writer never guesses wrapping, padding, or line height. */
+  private getBrowserFreeTextLayout(annotation: PdfFreeTextAnnoObject): BrowserFreeTextLayout | null {
+    const layout = (annotation.custom as any)?.yubin?.freeTextLayout as BrowserFreeTextLayout | undefined;
+    const contents = String(annotation.contents ?? '');
+    const close = (a: number, b: number) => Number.isFinite(a) && Math.abs(a - b) <= 0.01;
+    if (!layout || layout.version !== 1
+      || layout.sourceText !== contents
+      || layout.fontFamily !== annotation.fontFamily
+      || !close(layout.fontSize, annotation.fontSize)
+      || !close(layout.rect?.width, annotation.rect.size.width)
+      || !close(layout.rect?.height, annotation.rect.size.height)
+      || layout.textAlign !== annotation.textAlign
+      || layout.verticalAlign !== annotation.verticalAlign
+      || !Number.isFinite(layout.lineHeight)
+      || layout.lineHeight <= 0
+      || !Array.isArray(layout.lines)) {
+      this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'Managed Noto FreeText has no current browser layout contract');
+      return null;
+    }
+    let previousEnd = 0;
+    for (const line of layout.lines) {
+      if (!Number.isInteger(line.sourceStart) || !Number.isInteger(line.sourceEnd)
+        || line.sourceStart < previousEnd || line.sourceEnd < line.sourceStart
+        || line.sourceEnd > contents.length
+        || contents.slice(line.sourceStart, line.sourceEnd) !== line.text
+        || !Number.isFinite(line.x) || !Number.isFinite(line.baselineFromTop)) {
+        this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'Managed Noto FreeText browser layout contract is invalid');
+        return null;
+      }
+      previousEnd = line.sourceEnd;
+    }
+    return layout;
+  }
+
+  private measureEmbeddedKoreanFreeText(
+    fontContext: EmbeddedFontEntry,
+    value: string,
+    fontSize: number,
+  ): { left: number; bottom: number; right: number; top: number } {
+    const textObjectPtr = this.pdfiumModule.FPDFPageObj_CreateTextObj(
+      fontContext.docPtr,
+      fontContext.fontPtr,
+      fontSize,
+    );
+    if (!textObjectPtr) throw new Error('Could not create Korean FreeText measurement object');
+    try {
+      const setText = this.withWString(value, (textPtr) => this.pdfiumModule.FPDFText_SetText(textObjectPtr, textPtr));
+      if (!setText) throw new Error('Could not measure Korean FreeText text');
+      const pointers = [this.memoryManager.malloc(4), this.memoryManager.malloc(4), this.memoryManager.malloc(4), this.memoryManager.malloc(4)];
+      try {
+        if (!this.pdfiumModule.FPDFPageObj_GetBounds(textObjectPtr, pointers[0], pointers[1], pointers[2], pointers[3])) {
+          throw new Error('PDFium could not measure Korean FreeText text');
+        }
+        return {
+          left: this.pdfiumModule.pdfium.getValue(pointers[0], 'float'),
+          bottom: this.pdfiumModule.pdfium.getValue(pointers[1], 'float'),
+          right: this.pdfiumModule.pdfium.getValue(pointers[2], 'float'),
+          top: this.pdfiumModule.pdfium.getValue(pointers[3], 'float'),
+        };
+      } finally {
+        for (const pointer of pointers) this.memoryManager.free(pointer);
+      }
+    } finally {
+      this.pdfiumModule.FPDFPageObj_Destroy(textObjectPtr);
+    }
+  }
+
+  private getEmbeddedKoreanFreeTextMetrics(fontPtr: number, fontSize: number): { ascent: number; descent: number } | null {
+    const ascentPtr = this.memoryManager.malloc(4);
+    const descentPtr = this.memoryManager.malloc(4);
+    try {
+      if (!this.pdfiumModule.FPDFFont_GetAscent(fontPtr, fontSize, ascentPtr)
+        || !this.pdfiumModule.FPDFFont_GetDescent(fontPtr, fontSize, descentPtr)) {
+        this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'PDFium did not provide Korean FreeText font metrics');
+        return null;
+      }
+      return {
+        ascent: this.pdfiumModule.pdfium.getValue(ascentPtr, 'float'),
+        descent: this.pdfiumModule.pdfium.getValue(descentPtr, 'float'),
+      };
+    } finally {
+      this.memoryManager.free(ascentPtr);
+      this.memoryManager.free(descentPtr);
+    }
+  }
+
+  /**
+   * Read glyph boxes from the generated temporary PDFium page. This is not a
+   * second layout engine: it is the text geometry of the exact objects that
+   * are about to become the annotation appearance.
+   */
+  private collectEmbeddedKoreanFreeTextCharacterBoxes(
+    pagePtr: number,
+    lines: EmbeddedKoreanFreeTextLine[],
+  ): EmbeddedKoreanFreeTextLayout['characters'] | null {
+    const expected = lines.flatMap((line) => {
+      const characters: Array<{ text: string; sourceStart: number; sourceEnd: number }> = [];
+      let sourceOffset = line.sourceStart;
+      for (const text of Array.from(line.text)) {
+        characters.push({ text, sourceStart: sourceOffset, sourceEnd: sourceOffset + text.length });
+        sourceOffset += text.length;
+      }
+      return characters;
+    });
+    const textPagePtr = this.pdfiumModule.FPDFText_LoadPage(pagePtr);
+    if (!textPagePtr) {
+      this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'Could not read generated Korean FreeText glyph geometry');
+      return null;
+    }
+    try {
+      const output: EmbeddedKoreanFreeTextLayout['characters'] = [];
+      let expectedIndex = 0;
+      for (let index = 0; index < this.pdfiumModule.FPDFText_CountChars(textPagePtr); index++) {
+        const unicode = this.pdfiumModule.FPDFText_GetUnicode(textPagePtr, index);
+        // Text-page extraction inserts a separator between individual PDF text
+        // objects. It has no glyph or source range and must never become a
+        // selectable linked-highlight character.
+        if (unicode === 0x0a || unicode === 0x0d) continue;
+        // PDFium's extraction drops some whitespace (notably trailing wrap
+        // spaces and a repeated space). Advance only over those source
+        // offsets; they deliberately have no fabricated geometry.
+        while (expected[expectedIndex]?.text.trim() === ''
+          && unicode !== expected[expectedIndex].text.codePointAt(0)) {
+          expectedIndex++;
+        }
+        const character = expected[expectedIndex++];
+        if (!character || unicode !== character.text.codePointAt(0)) {
+          this.logger.error(
+            LOG_SOURCE,
+            LOG_CATEGORY,
+            'Generated Korean FreeText glyph order did not match layout source',
+            `index=${index} expected=${character?.text.codePointAt(0)} actual=${unicode}`,
+          );
+          return null;
+        }
+        const pointers = [this.memoryManager.malloc(8), this.memoryManager.malloc(8), this.memoryManager.malloc(8), this.memoryManager.malloc(8)];
+        try {
+          if (!this.pdfiumModule.FPDFText_GetCharBox(textPagePtr, index, pointers[0], pointers[1], pointers[2], pointers[3])) {
+            throw new Error('Could not read generated Korean FreeText glyph box');
+          }
+          output.push({
+            ...character,
+            box: {
+              left: this.pdfiumModule.pdfium.getValue(pointers[0], 'double'),
+              right: this.pdfiumModule.pdfium.getValue(pointers[1], 'double'),
+              bottom: this.pdfiumModule.pdfium.getValue(pointers[2], 'double'),
+              top: this.pdfiumModule.pdfium.getValue(pointers[3], 'double'),
+            },
+          });
+        } finally {
+          for (const pointer of pointers) this.memoryManager.free(pointer);
+        }
+      }
+      if (expected.slice(expectedIndex).some((character) => character.text.trim() !== '')) {
+        this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'Generated Korean FreeText glyph count did not match layout source');
+        return null;
+      }
+      return output;
+    } finally {
+      this.pdfiumModule.FPDFText_ClosePage(textPagePtr);
+    }
+  }
+
+  /** @internal Visible to the isolated writer harness for lifecycle evidence. */
+  public getEmbeddedKoreanFreeTextFontStats() {
+    return {
+      korean_font_load_count: this.embeddedKoreanFreeTextFontLoads,
+      korean_font_cache_hit_count: this.embeddedKoreanFreeTextFontCacheHits,
+      korean_font_close_count: this.embeddedKoreanFreeTextFontCloses,
+      live_korean_font_handle_count: [...this.cache.getContexts()].reduce(
+        (count, ctx) => count + ctx.getEmbeddedFontCount(),
+        0,
+      ),
+      korean_appearance_rebuild_count: this.embeddedKoreanFreeTextAppearanceRebuilds,
+    };
+  }
+
+  /** @internal Returns the PDFium-metric layout used by the current AP. */
+  public getEmbeddedKoreanFreeTextLayout(docId: string, annotationId: string) {
+    return this.embeddedKoreanFreeTextLayouts.get(`${docId}:${annotationId}`) ?? null;
+  }
+
+  /**
+   * Return geometry from the exact committed FreeText appearance. Korean APs
+   * retain their writer-time PDFium mapping; ordinary Latin APs are exported by
+   * PDFium and read back as a temporary one-page PDF. Neither branch invokes a
+   * browser layout engine or regenerates the annotation appearance.
+   */
+  public getCommittedFreeTextLayout(
+    docId: string,
+    pageIndex: number,
+    annotation: PdfAnnotationObject,
+  ): PdfTask<CommittedFreeTextLayout | null> {
+    const cached = this.embeddedKoreanFreeTextLayouts.get(`${docId}:${annotation.id}`);
+    if (cached) {
+      return PdfTaskHelper.resolve<CommittedFreeTextLayout | null>({
+        ...cached,
+        sourceText: String(annotation.contents ?? ''),
+        sourceEncoding: 'utf-16',
+        geometrySource: 'native-korean-appearance',
+        appearanceMatrix: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+      });
+    }
+
+    const ctx = this.cache.getContext(docId);
+    if (!ctx) {
+      return PdfTaskHelper.reject({
+        code: PdfErrorCode.DocNotOpen,
+        message: 'document does not open',
+      });
+    }
+
+    const pageCtx = ctx.acquirePage(pageIndex);
+    const annotPtr = this.getAnnotationByName(pageCtx.pagePtr, annotation.id);
+    if (!annotPtr) {
+      pageCtx.release();
+      return PdfTaskHelper.reject({ code: PdfErrorCode.NotFound, message: 'annotation not found' });
+    }
+
+    const exportedDocPtr = this.pdfiumModule.EPDFAnnot_ExportAppearanceAsDocument(annotPtr);
+    const appearanceMatrix = this.readAnnotationAppearanceMatrix(annotPtr);
+    this.pdfiumModule.FPDFPage_CloseAnnot(annotPtr);
+    pageCtx.release();
+    if (!exportedDocPtr) return PdfTaskHelper.resolve<CommittedFreeTextLayout | null>(null);
+
+    let exportedPagePtr = 0;
+    try {
+      exportedPagePtr = this.pdfiumModule.FPDF_LoadPage(exportedDocPtr, 0);
+      if (!exportedPagePtr) return PdfTaskHelper.resolve<CommittedFreeTextLayout | null>(null);
+      const layout = this.collectCommittedFreeTextAppearanceLayout(
+        exportedPagePtr,
+        annotation,
+        appearanceMatrix,
+      );
+      return PdfTaskHelper.resolve<CommittedFreeTextLayout | null>(layout);
+    } finally {
+      if (exportedPagePtr) this.pdfiumModule.FPDF_ClosePage(exportedPagePtr);
+      this.pdfiumModule.FPDF_CloseDocument(exportedDocPtr);
+    }
+  }
+
+  /** Read the AP matrix so consumers reject transformations they cannot prove. */
+  private readAnnotationAppearanceMatrix(annotationPtr: number): CommittedFreeTextLayout['appearanceMatrix'] {
+    const matrixPtr = this.memoryManager.malloc(24);
+    try {
+      const ok = this.pdfiumModule.EPDFAnnot_GetAPMatrix(annotationPtr, AppearanceMode.Normal, matrixPtr);
+      if (!ok) throw new Error('Could not read FreeText appearance matrix');
+      return {
+        a: this.pdfiumModule.pdfium.getValue(matrixPtr, 'float'),
+        b: this.pdfiumModule.pdfium.getValue(matrixPtr + 4, 'float'),
+        c: this.pdfiumModule.pdfium.getValue(matrixPtr + 8, 'float'),
+        d: this.pdfiumModule.pdfium.getValue(matrixPtr + 12, 'float'),
+        e: this.pdfiumModule.pdfium.getValue(matrixPtr + 16, 'float'),
+        f: this.pdfiumModule.pdfium.getValue(matrixPtr + 20, 'float'),
+      };
+    } finally {
+      this.memoryManager.free(matrixPtr);
+    }
+  }
+
+  /**
+   * Match extracted PDFium characters to UTF-16 source scalars in order. An
+   * explicit newline has no drawable glyph; whitespace PDFium legitimately
+   * omits is represented by no box instead of a fabricated rectangle.
+   */
+  private collectCommittedFreeTextAppearanceLayout(
+    appearancePagePtr: number,
+    annotation: PdfAnnotationObject,
+    appearanceMatrix: CommittedFreeTextLayout['appearanceMatrix'],
+  ): CommittedFreeTextLayout | null {
+    const sourceText = String(annotation.contents ?? '');
+    const expected: Array<{ text: string; sourceStart: number; sourceEnd: number }> = [];
+    let offset = 0;
+    for (const text of Array.from(sourceText)) {
+      const sourceStart = offset;
+      offset += text.length;
+      if (text === '\r' || text === '\n') continue;
+      expected.push({ text, sourceStart, sourceEnd: offset });
+    }
+    const textPagePtr = this.pdfiumModule.FPDFText_LoadPage(appearancePagePtr);
+    if (!textPagePtr) return null;
+    try {
+      const mappedCharacters: Array<EmbeddedKoreanFreeTextLayout['characters'][number] & {
+        origin: { x: number; y: number };
+      }> = [];
+      let expectedIndex = 0;
+      for (let index = 0; index < this.pdfiumModule.FPDFText_CountChars(textPagePtr); index++) {
+        const unicode = this.pdfiumModule.FPDFText_GetUnicode(textPagePtr, index);
+        if (unicode === 0x0a || unicode === 0x0d || unicode === 0xfffd || unicode === 0xfffe) continue;
+        while (expected[expectedIndex]?.text.trim() === ''
+          && unicode !== expected[expectedIndex].text.codePointAt(0)) {
+          expectedIndex++;
+        }
+        const character = expected[expectedIndex++];
+        if (!character || unicode !== character.text.codePointAt(0)) {
+          this.logger.error(
+            LOG_SOURCE,
+            LOG_CATEGORY,
+            'Committed FreeText AP glyph order did not match source',
+            `index=${index} expected=${character?.text.codePointAt(0)} actual=${unicode}`,
+          );
+          return null;
+        }
+        const pointers = [
+          this.memoryManager.malloc(8), this.memoryManager.malloc(8),
+          this.memoryManager.malloc(8), this.memoryManager.malloc(8),
+        ];
+        try {
+          if (!this.pdfiumModule.FPDFText_GetCharBox(
+            textPagePtr, index, pointers[0], pointers[1], pointers[2], pointers[3],
+          )) return null;
+          const originPointers = [this.memoryManager.malloc(8), this.memoryManager.malloc(8)];
+          try {
+            if (!this.pdfiumModule.FPDFText_GetCharOrigin(textPagePtr, index, originPointers[0], originPointers[1])) {
+              return null;
+            }
+            mappedCharacters.push({
+            ...character,
+            box: {
+              left: this.pdfiumModule.pdfium.getValue(pointers[0], 'double'),
+              right: this.pdfiumModule.pdfium.getValue(pointers[1], 'double'),
+              bottom: this.pdfiumModule.pdfium.getValue(pointers[2], 'double'),
+              top: this.pdfiumModule.pdfium.getValue(pointers[3], 'double'),
+            },
+              origin: {
+                x: this.pdfiumModule.pdfium.getValue(originPointers[0], 'double'),
+                y: this.pdfiumModule.pdfium.getValue(originPointers[1], 'double'),
+              },
+            });
+          } finally {
+            for (const pointer of originPointers) this.memoryManager.free(pointer);
+          }
+        } finally {
+          for (const pointer of pointers) this.memoryManager.free(pointer);
+        }
+      }
+      if (expected.slice(expectedIndex).some((character) => character.text.trim() !== '')) {
+        this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'Committed FreeText AP glyph count did not match source');
+        return null;
+      }
+
+      const fontSize = mappedCharacters.length
+        ? this.pdfiumModule.FPDFText_GetFontSize(textPagePtr, 0)
+        : 0;
+      const lineMap = new Map<string, typeof mappedCharacters>();
+      for (const character of mappedCharacters) {
+        // The glyph box bottom changes for descenders and punctuation. The
+        // PDFium text origin is the shared baseline for a committed line.
+        const key = `${Math.round(character.origin.y * 1000) / 1000}`;
+        const line = lineMap.get(key) ?? [];
+        line.push(character);
+        lineMap.set(key, line);
+      }
+      const drawableLines = [...lineMap.values()]
+        .sort((a, b) => b[0].origin.y - a[0].origin.y)
+        .map((line) => {
+          const left = Math.min(...line.map((character) => character.box.left));
+          const right = Math.max(...line.map((character) => character.box.right));
+          const bottom = Math.min(...line.map((character) => character.box.bottom));
+          const top = Math.max(...line.map((character) => character.box.top));
+          return {
+            text: line.map((character) => character.text).join(''),
+            sourceStart: line[0].sourceStart,
+            sourceEnd: line[line.length - 1].sourceEnd,
+            width: right - left,
+            // PDFium's char origin is the only authoritative baseline.  Do
+            // not substitute an ink-box bottom: descenders make that vary
+            // within a single committed line.
+            origin: { x: line[0].origin.x, y: line[0].origin.y },
+            bounds: { left, right, bottom, top },
+          };
+        });
+      // PDFium text extraction deliberately has no glyph for an explicit
+      // empty FreeText line.  The /AP nevertheless advances the text matrix
+      // for it (including leading and trailing newlines).  Reconstruct only
+      // those logical records from the source UTF-16 contract and the actual
+      // committed line baselines; glyph geometry remains absent rather than
+      // fabricated.  This is needed for deterministic linked-range state and
+      // for consumers that must distinguish `a\n` from `a`.
+      const explicitLines: Array<{ sourceStart: number; sourceEnd: number; text: string }> = [];
+      let explicitStart = 0;
+      for (let index = 0; index < sourceText.length;) {
+        const code = sourceText.charCodeAt(index);
+        if (code !== 0x0a && code !== 0x0d) { index++; continue; }
+        explicitLines.push({ sourceStart: explicitStart, sourceEnd: index, text: sourceText.slice(explicitStart, index) });
+        if (code === 0x0d && sourceText.charCodeAt(index + 1) === 0x0a) index += 2;
+        else index += 1;
+        explicitStart = index;
+      }
+      explicitLines.push({ sourceStart: explicitStart, sourceEnd: sourceText.length, text: sourceText.slice(explicitStart) });
+      const explicitIndexForOffset = (offset: number) => explicitLines.findIndex(
+        line => offset >= line.sourceStart && offset <= line.sourceEnd,
+      );
+      const advances = drawableLines.slice(1).map((line, index) => {
+        const previous = drawableLines[index];
+        const from = explicitIndexForOffset(previous.sourceStart);
+        const to = explicitIndexForOffset(line.sourceStart);
+        return from >= 0 && to > from ? (previous.origin.y - line.origin.y) / (to - from) : 0;
+      }).filter(value => Number.isFinite(value) && value > 0.001);
+      // EmbedPDF's stock FreeText writer uses 1.169002em leading.  This
+      // fallback is used only where the committed AP contains one drawable
+      // line, so no inter-line baseline can be measured directly.
+      const lineAdvance = advances.length
+        ? advances.reduce((total, value) => total + value, 0) / advances.length
+        : fontSize * 1.169002;
+      const lines = [...drawableLines];
+      for (let index = 0; index < explicitLines.length; index++) {
+        const logical = explicitLines[index];
+        if (logical.text) continue;
+        const before = [...drawableLines].reverse().find(line => line.sourceEnd <= logical.sourceStart);
+        const after = drawableLines.find(line => line.sourceStart >= logical.sourceEnd);
+        const reference = before ?? after;
+        if (!reference) continue;
+        const referenceIndex = explicitIndexForOffset(before ? before.sourceStart : after!.sourceStart);
+        const y = reference.origin.y + (before ? -(index - referenceIndex) : (referenceIndex - index)) * lineAdvance;
+        lines.push({
+          text: '', sourceStart: logical.sourceStart, sourceEnd: logical.sourceEnd,
+          width: 0, origin: { x: reference.origin.x, y },
+          bounds: { left: reference.origin.x, right: reference.origin.x, bottom: y, top: y },
+        });
+      }
+      lines.sort((a, b) => a.sourceStart - b.sourceStart || a.sourceEnd - b.sourceEnd);
+      const pageWidth = this.pdfiumModule.FPDF_GetPageWidth(appearancePagePtr);
+      const pageHeight = this.pdfiumModule.FPDF_GetPageHeight(appearancePagePtr);
+      return {
+        annotationId: annotation.id,
+        sourceText,
+        sourceEncoding: 'utf-16',
+        geometrySource: 'exported-committed-appearance',
+        appearanceMatrix,
+        rectangle: { width: pageWidth, height: pageHeight },
+        padding: 0,
+        availableWidth: pageWidth,
+        fontSize,
+        ascent: 0,
+        descent: 0,
+        lineAdvance: 0,
+        textAlign: (annotation as any).textAlign ?? PdfTextAlignment.Left,
+        lines,
+        characters: mappedCharacters.map(({ origin: _origin, ...character }) => character),
+      };
+    } finally {
+      this.pdfiumModule.FPDFText_ClosePage(textPagePtr);
+    }
+  }
+
+  private releaseEmbeddedKoreanFreeTextLayouts(docId: string): void {
+    for (const key of this.embeddedKoreanFreeTextLayouts.keys()) {
+      if (key.startsWith(`${docId}:`)) this.embeddedKoreanFreeTextLayouts.delete(key);
+    }
+  }
+
+  private getEmbeddedKoreanFreeTextFont(ctx: DocumentContext): EmbeddedFontEntry | null {
+    const fontBytes = this.fontFallbackManager?.loadFontForCharset(FontCharset.HANGEUL);
+    if (!fontBytes?.byteLength) {
+      this.logger.error(
+        LOG_SOURCE,
+        LOG_CATEGORY,
+        'Cannot create Korean FreeText: the configured Hangeul font was unavailable',
+      );
+      return null;
+    }
+
+    const identity = this.fontFallbackManager?.getWriterFontIdentity(FontCharset.HANGEUL)
+      ?? `font-bytes:${fontBytes.byteLength}`;
+    const key = `${identity}|charset=${FontCharset.HANGEUL}|weight=400|italic=false`;
+    const result = ctx.getOrLoadEmbeddedFont(key, () => {
+      const fontBytesPtr = this.memoryManager.malloc(fontBytes.byteLength);
+      let fontPtr = 0;
+      try {
+        this.pdfiumModule.pdfium.HEAPU8.set(fontBytes, fontBytesPtr);
+        fontPtr = this.pdfiumModule.FPDFText_LoadFont(
+          ctx.docPtr,
+          fontBytesPtr,
+          fontBytes.byteLength,
+          2,
+          true,
+        );
+      } finally {
+        this.memoryManager.free(fontBytesPtr);
+      }
+      if (!fontPtr) {
+        this.logger.error(LOG_SOURCE, LOG_CATEGORY, 'PDFium rejected the configured Hangeul font');
+        return null;
+      }
+      this.embeddedKoreanFreeTextFontLoads++;
+      return { docPtr: ctx.docPtr, fontPtr };
+    });
+    if (result.cacheHit) this.embeddedKoreanFreeTextFontCacheHits++;
+    return result.entry;
+  }
+
+
+  private requiresEmbeddedKoreanFreeTextAppearance(annotation: PdfAnnotationObject): boolean {
+    return annotation.type === PdfAnnotationSubtype.FREETEXT
+      && annotation.fontFamily === PdfStandardFont.NotoSansKR;
+  }
+
+  private hasEmbeddedKoreanFreeTextAppearance(annotationPtr: number): boolean {
+    return this.getAnnotString(annotationPtr, 'EPDF:YubinFontFamily') === 'NotoSansKR';
   }
 
   private addTextFieldContent(
@@ -7583,7 +8379,13 @@ export class PdfiumNative implements IPdfiumExecutor {
       id: index,
       type: PdfAnnotationSubtype.FREETEXT,
       rect,
-      fontFamily: da?.fontFamily ?? PdfStandardFont.Unknown,
+      // A registered Noto family is represented by its embedded AP, because
+      // PDFium's `/DA` API only serializes Base-14 font enums. Restore the
+      // stable model identifier from that appearance rather than degrading it
+      // to Helvetica after a save/reopen cycle.
+      fontFamily: this.hasEmbeddedKoreanFreeTextAppearance(annotationPtr)
+        ? PdfStandardFont.NotoSansKR
+        : da?.fontFamily ?? PdfStandardFont.Unknown,
       fontSize: da?.fontSize ?? 12,
       fontColor: textColor ?? da?.fontColor ?? '#000000',
       verticalAlign,

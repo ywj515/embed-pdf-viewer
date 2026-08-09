@@ -401,6 +401,41 @@ export class FontFallbackManager {
     );
   }
 
+  /**
+   * Return the configured font bytes for a charset.
+   *
+   * PDFium's system-font callbacks cover rendering of existing PDFs, but a
+   * writer that creates a new Type0/CID text object must explicitly provide
+   * the bytes to `FPDFText_LoadFont`. Keeping this loader here guarantees that
+   * the writer and renderer use the same configured, self-hosted resource.
+   */
+  loadFontForCharset(charset: FontCharset): Uint8Array | null {
+    const url = this.getFontUrlForCharset(charset);
+    if (!url) {
+      this.logger.error(LOG_SOURCE, LOG_CATEGORY, `No configured font for charset ${charset}`);
+      return null;
+    }
+
+    const cached = this.fontCache.get(url);
+    if (cached) {
+      return cached;
+    }
+
+    const data = this.fetchFontSync(url);
+    if (!data) {
+      this.logger.error(LOG_SOURCE, LOG_CATEGORY, `Failed to load writer font: ${url}`);
+      return null;
+    }
+
+    this.fontCache.set(url, data);
+    return data;
+  }
+
+  /** Canonical configured resource identity for document-scoped writer caches. */
+  getWriterFontIdentity(charset: FontCharset): string | null {
+    return this.getFontUrlForCharset(charset);
+  }
+
   // ============================================================================
   // PDFium Callback Implementations
   // ============================================================================
@@ -693,11 +728,19 @@ export class FontFallbackManager {
     try {
       const xhr = new XMLHttpRequest();
       xhr.open('GET', pathOrUrl, false); // false = synchronous
-      xhr.responseType = 'arraybuffer';
+      // Chromium rejects `responseType = 'arraybuffer'` on a synchronous XHR
+      // from a Window. The PDFium callback is synchronous, so preserve the
+      // raw bytes with the legacy byte-string response instead. Workers may
+      // also use this path, keeping the writer's loader consistent everywhere.
+      xhr.overrideMimeType('text/plain; charset=x-user-defined');
       xhr.send();
 
       if (xhr.status === 200) {
-        const data = new Uint8Array(xhr.response as ArrayBuffer);
+        const byteString = xhr.responseText;
+        const data = new Uint8Array(byteString.length);
+        for (let index = 0; index < byteString.length; index++) {
+          data[index] = byteString.charCodeAt(index) & 0xff;
+        }
         this.logger.info(
           LOG_SOURCE,
           LOG_CATEGORY,

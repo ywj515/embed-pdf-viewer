@@ -518,12 +518,16 @@ const freeTextTools = [
       contents: 'Insert text',
       fontSize: 14,
       fontColor: '#E44234',
-      fontFamily: PdfStandardFont.Helvetica,
+      // This bundled Notes runtime owns newly-created FreeText. Select the
+      // registered Type0/CID writer before the model is inserted; correcting
+      // Helvetica after create can leave a blank /AP/N in a saved PDF.
+      fontFamily: PdfStandardFont.NotoSansKR,
       textAlign: PdfTextAlignment.Left,
       verticalAlign: PdfVerticalAlignment.Top,
       color: 'transparent', // fill color (matches shape convention)
       backgroundColor: 'transparent', // deprecated alias
       opacity: 1,
+      custom: { yubin: { managedFreeText: true } },
     },
     clickBehavior: {
       enabled: true,

@@ -2,7 +2,6 @@ import { Fragment, h, ComponentChildren } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
 
 import {
-  STANDARD_FONT_FAMILIES,
   PdfStandardFontFamily,
   standardFontFamilyLabel,
   PdfAnnotationBorderStyle,
@@ -408,14 +407,13 @@ export const FontFamilySelect = (props: {
   value: PdfStandardFontFamily;
   onChange: (fam: PdfStandardFontFamily) => void;
 }) => (
-  <GenericSelect
-    {...props}
-    options={STANDARD_FONT_FAMILIES}
-    getOptionKey={(f) => f}
-    triggerClass="px-2 py-1 text-sm"
-    renderValue={(v) => <span>{standardFontFamilyLabel(v)}</span>}
-    renderOption={(f) => <div class="px-2 py-1">{standardFontFamilyLabel(f)}</div>}
-  />
+  // Yubin deliberately exposes no font-changing UI for managed FreeText.
+  // Keep this a read-only model label rather than a misleading Noto label:
+  // externally supplied annotations retain—and accurately show—their own
+  // family without being rewritten by the application.
+  <div data-epdf-font-family-fixed class="border-border-default bg-bg-input px-2 py-1 text-sm rounded border">
+    {standardFontFamilyLabel(props.value)}
+  </div>
 );
 
 // —— Rotation input ─────────────────────────────────────────────────
