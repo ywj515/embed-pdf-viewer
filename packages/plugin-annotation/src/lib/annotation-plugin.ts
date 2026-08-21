@@ -1004,7 +1004,7 @@ export class AnnotationPlugin extends BasePlugin<
       const id = annotation.id;
       // Import is deliberately non-migrating. Historical managed sizes remain
       // unchanged until the user explicitly changes their font size.
-      const managedAnnotation = this.normalizeYubinManagedFreeText(annotation, false);
+      const managedAnnotation = this.normalizeYubinManagedFreeText(annotation);
 
       this.dispatch(createAnnotation(documentId, pageIndex, managedAnnotation));
       if (ctx) contexts.set(id, ctx);
@@ -1089,7 +1089,7 @@ export class AnnotationPlugin extends BasePlugin<
   /** Enforce the native Noto writer without changing imported external PDF annotations. */
   private normalizeYubinManagedFreeText<A extends PdfAnnotationObject>(
     annotation: A,
-    canonicalizeFontSize: boolean,
+    canonicalizeFontSize = false,
   ): A {
     if (!this.isYubinManagedFreeText(annotation)) return annotation;
     return {
